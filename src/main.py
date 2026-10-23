@@ -738,6 +738,8 @@ def apply_theme(root):
     import tkinter as tk
     import tkinter.ttk as ttk
     pal = THEME["light"] if system_is_light() else THEME["dark"]
+    global _CURRENT_PAL
+    _CURRENT_PAL = pal
     style = ttk.Style(root)
     try:
         style.theme_use("clam")
@@ -768,6 +770,13 @@ def apply_theme(root):
                     borderwidth=1, arrowcolor=fg, padding=4)
     style.map("TCombobox", fieldbackground=[("readonly", field)],
               background=[("readonly", btn)])
+    # 数字调节框：clam 默认白底字段，必须显式配色，否则深色主题下露白
+    style.configure("TSpinbox", fieldbackground=field, foreground=fg, background=btn,
+                    borderwidth=1, bordercolor=pal["border"], insertcolor=fg,
+                    arrowcolor=fg, padding=2)
+    style.map("TSpinbox",
+              fieldbackground=[("readonly", field), ("disabled", field)],
+              background=[("active", btn), ("pressed", field)])
     style.configure("TCheckbutton", background=bg, foreground=fg, font=FONT_MAIN)
     style.configure("Horizontal.TProgressbar", background=accent, troughcolor=pal["border"],
                     borderwidth=0)
@@ -783,14 +792,32 @@ def _spinbox_class():
     return tk.Spinbox
 
 
-def make_entry(parent, textvar, width=10):
-    import tkinter.ttk as ttk
-    return ttk.Entry(parent, textvariable=textvar, width=width)
+# apply_theme 设置的当前调色板（供经典控件回退路径直接配色）
+_CURRENT_PAL = None
 
 
 def make_spin(parent, var, from_, to, width=6):
+    """数字调节框。ttk.Spinbox 用 TSpinbox 样式；经典回退则直接配色防止露白。"""
+    import tkinter.ttk as ttk
     cls = _spinbox_class()
-    return cls(parent, from_=from_, to=to, textvariable=var, width=width)
+    if cls is ttk.Spinbox:
+        return cls(parent, from_=from_, to=to, textvariable=var, width=width,
+                   style="TSpinbox")
+    sp = cls(parent, from_=from_, to=to, textvariable=var, width=width)
+    pal = _CURRENT_PAL or THEME["light"]
+    try:
+        sp.configure(background=pal["field"], foreground=pal["fg"],
+                     insertbackground=pal["fg"], buttonbackground=pal["btn"],
+                     highlightbackground=pal["border"], highlightcolor=pal["border"],
+                     relief="flat", bd=1)
+    except Exception:
+        pass
+    return sp
+
+
+def make_entry(parent, textvar, width=10):
+    import tkinter.ttk as ttk
+    return ttk.Entry(parent, textvariable=textvar, width=width)
 
 
 class CountdownWindow:
