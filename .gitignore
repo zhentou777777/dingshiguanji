@@ -1,0 +1,20 @@
+# 构建产物
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# 运行时状态（本机数据，不入库）
+config.json
+state.json
+actions.log
+
+# 编辑器
+.vscode/
+.idea/
