@@ -102,6 +102,45 @@ def log_action(msg):
         pass
 
 
+def safe_print(*a, **kw):
+    """ShellExecute 启动的进程可能没有控制台（sys.stdout 为 None），避免 print 崩溃。"""
+    try:
+        if sys.stdout is not None:
+            print(*a, **kw)
+    except Exception:
+        pass
+
+
+# 提权子进程的结果回传：--result-file 参数优先，环境变量兜底
+_RESULT_FILE = None
+_RESULT_WRITTEN = False
+
+
+def set_result_file(path):
+    global _RESULT_FILE
+    _RESULT_FILE = path or None
+
+
+def write_result(ok, error=""):
+    """把结果写给父进程。任何情况下都不允许抛异常。"""
+    global _RESULT_WRITTEN
+    p = _RESULT_FILE or os.environ.get("SELFSHUTDOWN_RESULT")
+    if not p:
+        return
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"ok": bool(ok), "error": str(error)}, f, ensure_ascii=False)
+        _RESULT_WRITTEN = True
+    except Exception:
+        pass
+
+
+def write_result_missing(rc):
+    """进程即将退出但没写过结果时，兜底写一条，保证父进程能拿到真实退出码。"""
+    if _RESULT_FILE and not _RESULT_WRITTEN:
+        write_result(False, "子进程未返回明细（退出码 %s），请查看 EXE 同目录 actions.log" % rc)
+
+
 def _coerce_bool(v):
     if isinstance(v, bool):
         return v
@@ -291,25 +330,16 @@ def run_elevated_and_wait(argv, timeout_ms=120000):
             ctypes.windll.kernel32.CloseHandle(sei.hProcess)
 
 
-def write_result(ok, error=""):
-    p = os.environ.get("SELFSHUTDOWN_RESULT")
-    if not p:
-        return
-    try:
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump({"ok": bool(ok), "error": str(error)}, f, ensure_ascii=False)
-    except Exception:
-        pass
-
-
 def elevated_do(argv):
     """GUI/CLI 调用的提权执行入口。返回 (ok, error)。"""
-    result_file = os.path.join(tempfile.gettempdir(), "selfshutdown_result.json")
+    # 结果文件放在 EXE 同目录：无论哪个管理员账户批准的 UAC，发起用户都能读到
+    result_file = os.path.join(app_dir(), ".elevate_result.json")
     try:
         os.remove(result_file)
     except OSError:
         pass
     os.environ["SELFSHUTDOWN_RESULT"] = result_file
+    argv = list(argv) + ["--result-file", result_file]
     try:
         code = run_elevated_and_wait(argv)
     except OSError as e:
@@ -477,7 +507,7 @@ def task_xml(cfg, triggers_xml, task_args, principal_xml, exec_time_limit="PT30M
     on_battery_block = "false" if cfg["run_on_battery"] else "true"
     xml = (
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n"
-        "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/02/task\">\n"
+        "<Task version=\"1.3\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n"
         "  <RegistrationInfo>\n"
         "    <Date>%s</Date>\n"
         "    <Author>%s</Author>\n"
@@ -629,6 +659,10 @@ def task_state(cfg, name):
 
 
 STATE_LABELS = {"enabled": "已安装·启用", "disabled": "已安装·已禁用", "missing": "未安装"}
+
+# 关机方式：界面显示中文，配置存储英文值
+MODE_LABELS = {"force": "强制关机", "graceful": "优雅关机"}
+MODE_VALUES = {v: k for k, v in MODE_LABELS.items()}
 
 
 def guardian_main(cfg, dry_run=False):
@@ -1000,10 +1034,11 @@ class SettingsApp:
         ttk.Label(f1, text="（HH:MM，24 小时制）", style="Hint.TLabel").grid(
             row=0, column=2, columnspan=2, sticky="w", padx=(8, 0))
         ttk.Label(f1, text="关机方式").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0))
-        self._var("shutdown_mode", tk.StringVar(value=self.cfg["shutdown_mode"]))
+        self._var("shutdown_mode",
+                  tk.StringVar(value=MODE_LABELS.get(self.cfg["shutdown_mode"], "强制关机")))
         cb = ttk.Combobox(f1, textvariable=self._vars["shutdown_mode"], width=14,
                           state="readonly",
-                          values=["force", "graceful"])
+                          values=[MODE_LABELS["force"], MODE_LABELS["graceful"]])
         cb.grid(row=1, column=1, sticky="w", pady=(6, 0))
         cb.bind("<<ComboboxSelected>>", lambda e: self._update_mode_hint())
         self._mode_label = ttk.Label(f1, text="", style="Hint.TLabel")
@@ -1093,8 +1128,8 @@ class SettingsApp:
         return var
 
     def _update_mode_hint(self):
-        mode = self._vars["shutdown_mode"].get()
-        if mode == "graceful":
+        label = self._vars["shutdown_mode"].get()
+        if label == MODE_LABELS["graceful"]:
             self._mode_label.configure(text="优雅：给程序 10 秒自行保存，卡死的由系统超时强杀")
         else:
             self._mode_label.configure(text="强制：立即关机，仅跳过未响应程序，不影响驱动")
@@ -1110,7 +1145,7 @@ class SettingsApp:
         """从界面收集配置（含校验）。"""
         cfg = dict(self.cfg)
         cfg["shutdown_time"] = self._vars["shutdown_time"].get().strip()
-        cfg["shutdown_mode"] = self._vars["shutdown_mode"].get()
+        cfg["shutdown_mode"] = MODE_VALUES.get(self._vars["shutdown_mode"].get(), "force")
         cfg["warn_message"] = self._vars["warn_message"].get().strip() or DEFAULT_CONFIG["warn_message"]
         cfg["retry_count"] = self._vars["retry_count"].get()
         cfg["retry_interval_minutes"] = self._vars["retry_interval_minutes"].get()
@@ -1141,7 +1176,8 @@ class SettingsApp:
 
     def _sync_vars(self):
         self._vars["shutdown_time"].set(self.cfg["shutdown_time"])
-        self._vars["shutdown_mode"].set(self.cfg["shutdown_mode"])
+        self._vars["shutdown_mode"].set(
+            MODE_LABELS.get(self.cfg["shutdown_mode"], "强制关机"))
         self._vars["warn_seconds"].set(str(self.cfg["warn_seconds"]))
         self._vars["warn_message"].set(self.cfg["warn_message"])
         self._vars["retry_count"].set(str(self.cfg["retry_count"]))
@@ -1161,7 +1197,11 @@ class SettingsApp:
             else:
                 ok, err = elevated_do(["--install"])
                 if not ok:
-                    self.messagebox.showerror("安装失败", err)
+                    self.messagebox.showerror(
+                        "安装失败", "%s\n\n排查建议：\n"
+                        "1. 查看 EXE 同目录 actions.log 的最后几行\n"
+                        "2. 如装有 360/电脑管家，请将本程序加入信任后重试\n"
+                        "3. 确认当前 Windows 账户是管理员" % err)
                     return
             self.messagebox.showinfo("安装完成",
                                      "计划任务已创建：\n"
@@ -1185,7 +1225,9 @@ class SettingsApp:
             else:
                 ok, err = elevated_do(["--uninstall"])
                 if not ok:
-                    self.messagebox.showerror("卸载失败", err)
+                    self.messagebox.showerror(
+                        "卸载失败", "%s\n\n可手动删除：schtasks /Delete /TN \\SelfDisciplineShutdown\\Enforcement /F\n"
+                        "（另两个任务名：Warning、Guardian）" % err)
                     return
             self.messagebox.showinfo("已卸载", "计划任务已删除。程序目录可自行删除。")
         except Exception as e:
@@ -1223,7 +1265,12 @@ class SettingsApp:
                 else:
                     ok, err = elevated_do(["--test"] + (["--dry-run"] if dry_var.get() else []))
                     if not ok:
-                        self.messagebox.showerror("创建失败", err, parent=win)
+                        self.messagebox.showerror(
+                            "创建失败",
+                            "%s\n\n排查建议：\n"
+                            "1. 查看 EXE 同目录 actions.log 的最后几行\n"
+                            "2. 如装有 360/电脑管家，请将本程序加入信任后重试" % err,
+                            parent=win)
                         return
             except Exception as e:
                 log_action("test 失败: %s" % traceback.format_exc())
@@ -1282,16 +1329,16 @@ def cli_install():
     cfg = load_config()
     if not is_admin():
         ok, err = elevated_do(["--install"])
-        print(err or "安装完成")
+        safe_print(err or "安装完成")
         return 0 if ok else 1
     try:
         install_tasks(cfg)
         write_result(True)
-        print("OK: 计划任务已创建/更新")
+        safe_print("OK: 计划任务已创建/更新")
         return 0
     except Exception as e:
         write_result(False, str(e))
-        print("FAIL: %s" % e)
+        safe_print("FAIL: %s" % e)
         return 1
 
 
@@ -1299,16 +1346,16 @@ def cli_uninstall():
     cfg = load_config()
     if not is_admin():
         ok, err = elevated_do(["--uninstall"])
-        print(err or "已卸载")
+        safe_print(err or "已卸载")
         return 0 if ok else 1
     try:
         uninstall_tasks(cfg)
         write_result(True)
-        print("OK: 计划任务已删除")
+        safe_print("OK: 计划任务已删除")
         return 0
     except Exception as e:
         write_result(False, str(e))
-        print("FAIL: %s" % e)
+        safe_print("FAIL: %s" % e)
         return 1
 
 
@@ -1317,27 +1364,27 @@ def cli_test(dry_run):
     if not is_admin():
         argv = ["--test"] + (["--dry-run"] if dry_run else [])
         ok, err = elevated_do(argv)
-        print(err or "测试任务已创建")
+        safe_print(err or "测试任务已创建")
         return 0 if ok else 1
     try:
         args = "--enforce" + (" --dry-run" if dry_run else "")
         install_one(cfg, TASK_TEST, extra_args=args)
         write_result(True)
-        print("OK: 测试任务已创建（2 分钟后触发，%s）"
-              % ("演练模式" if dry_run else "真实关机"))
+        safe_print("OK: 测试任务已创建（2 分钟后触发，%s）"
+                   % ("演练模式" if dry_run else "真实关机"))
         return 0
     except Exception as e:
         write_result(False, str(e))
-        print("FAIL: %s" % e)
+        safe_print("FAIL: %s" % e)
         return 1
 
 
 def cli_status():
     cfg = load_config()
-    print("程序路径: %s" % exe_path())
-    print("跳过状态: %s" % skip_status_text())
+    safe_print("程序路径: %s" % exe_path())
+    safe_print("跳过状态: %s" % skip_status_text())
     for name in ALL_TASKS:
-        print("%-10s %s" % (name, STATE_LABELS.get(task_state(cfg, name), "?")))
+        safe_print("%-10s %s" % (name, STATE_LABELS.get(task_state(cfg, name), "?")))
     return 0
 
 
@@ -1379,28 +1426,39 @@ def main():
     parser.add_argument("--warn", action="store_true")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--dry-run", action="store_true", dest="dry_run")
+    parser.add_argument("--result-file", dest="result_file", default=None)
     args, _unknown = parser.parse_known_args()
 
+    set_result_file(args.result_file)
+    log_action("startup: argv=%s admin=%s result_file=%s"
+               % (" ".join(sys.argv[1:]), is_admin(),
+                  bool(args.result_file or os.environ.get("SELFSHUTDOWN_RESULT"))))
+
     cfg = load_config()
+    rc = 0
     try:
         if args.install:
-            return cli_install()
-        if args.uninstall:
-            return cli_uninstall()
-        if args.test:
-            return cli_test(args.dry_run)
-        if args.guardian:
-            return guardian_main(cfg, dry_run=args.dry_run)
-        if args.enforce:
-            return enforce_main(cfg, dry_run=args.dry_run)
-        if args.warn:
-            return warn_main(dry_run=args.dry_run)
-        if args.status:
-            return cli_status()
-        return gui_main()
+            rc = cli_install()
+        elif args.uninstall:
+            rc = cli_uninstall()
+        elif args.test:
+            rc = cli_test(args.dry_run)
+        elif args.guardian:
+            rc = guardian_main(cfg, dry_run=args.dry_run)
+        elif args.enforce:
+            rc = enforce_main(cfg, dry_run=args.dry_run)
+        elif args.warn:
+            rc = warn_main(dry_run=args.dry_run)
+        elif args.status:
+            rc = cli_status()
+        else:
+            rc = gui_main()
     except Exception:
         log_action("FATAL: " + traceback.format_exc())
-        return 1
+        rc = 1
+    finally:
+        write_result_missing(rc)
+    return rc
 
 
 if __name__ == "__main__":
